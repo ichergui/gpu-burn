@@ -43,6 +43,7 @@
 #include <sys/types.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/time.h>
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
@@ -120,9 +121,19 @@ void checkError(cublasStatus_t rCode, std::string desc = "") {
 			g_errorStrings[rCode];
 }
 
+double getTime()
+{
+	struct timeval t;
+	gettimeofday(&t, NULL);
+	return (double)t.tv_sec + (double)t.tv_usec / 1e6;
+}
+
+bool g_running = false;
+
 template <class T> class GPU_Test {
 	public:
-	GPU_Test(int dev, bool doubles) : d_devNumber(dev), d_doubles(doubles) {
+	GPU_Test(int dev, bool doubles, bool tensors) : 
+			d_devNumber(dev), d_doubles(doubles), d_tensors(tensors) {
 		checkError(cuDeviceGet(&d_dev, d_devNumber));
 		checkError(cuCtxCreate(&d_ctx, 0, d_dev));
 
@@ -131,20 +142,40 @@ template <class T> class GPU_Test {
 		//checkError(cublasInit());
 		checkError(cublasCreate(&d_cublas), "init");
 
+		if(d_tensors)
+			checkError(cublasSetMathMode(d_cublas, CUBLAS_TENSOR_OP_MATH));
+
+		checkError(cuMemAllocHost((void**)&d_faultyElemsHost, sizeof(int)));
 		d_error = 0;
+
+		g_running = true;
+
+		struct sigaction action;
+		memset(&action, 0, sizeof(struct sigaction));
+		action.sa_handler = termHandler;
+		sigaction(SIGTERM, &action, NULL);
 	}
 	~GPU_Test() {
 		bind();
 		checkError(cuMemFree(d_Cdata), "Free A");
 		checkError(cuMemFree(d_Adata), "Free B");
 		checkError(cuMemFree(d_Bdata), "Free C");
+		cuMemFreeHost(d_faultyElemsHost);
 		printf("Freed memory for dev %d\n", d_devNumber);
 
 		cublasDestroy(d_cublas);
 		printf("Uninitted cublas\n");
 	}
 
+	static void termHandler(int signum)
+	{
+		g_running = false;
+	}
+
 	unsigned long long int getErrors() {
+		if (*d_faultyElemsHost) {
+			d_error += (long long int)*d_faultyElemsHost;
+		}
 		unsigned long long int tempErrs = d_error;
 		d_error = 0;
 		return tempErrs;
@@ -176,9 +207,9 @@ template <class T> class GPU_Test {
 		bind();
 
 		size_t useBytes = (size_t)((double)availMemory()*usemem);
-		printf("Initialized device %d with %lu MB of memory (%lu MB available, using %lu MB of it), %s\n",
+		printf("Initialized device %d with %lu MB of memory (%lu MB available, using %lu MB of it), %s%s\n",
 				d_devNumber, totalMemory()/1024ul/1024ul, availMemory()/1024ul/1024ul, useBytes/1024ul/1024ul,
-				d_doubles ? "using DOUBLES" : "using FLOATS");
+				d_doubles ? "using DOUBLES" : "using FLOATS", d_tensors ? ", using Tensor Cores" : "");
 		size_t d_resultSize = sizeof(T)*SIZE*SIZE;
 		d_iters = (useBytes - 2*d_resultSize)/d_resultSize; // We remove A and B sizes
 		//printf("Results are %d bytes each, thus performing %d iterations\n", d_resultSize, d_iters);
@@ -240,18 +271,19 @@ template <class T> class GPU_Test {
 	}
 
 	void compare() {
-		int faultyElems;
-		checkError(cuMemsetD32(d_faultyElemData, 0, 1), "memset");
-		checkError(cuLaunchGrid(d_function, SIZE/g_blockSize, SIZE/g_blockSize), "Launch grid");
-		checkError(cuMemcpyDtoH(&faultyElems, d_faultyElemData, sizeof(int)), "Read faultyelemdata");
-		if (faultyElems) {
-			d_error += (long long int)faultyElems;
-			//printf("WE FOUND %d FAULTY ELEMENTS from GPU %d\n", faultyElems, d_devNumber);
-		}
+		checkError(cuMemsetD32Async(d_faultyElemData, 0, 1, 0), "memset");
+		checkError(cuLaunchGridAsync(d_function, SIZE/g_blockSize, SIZE/g_blockSize, 0), "Launch grid");
+		checkError(cuMemcpyDtoHAsync(d_faultyElemsHost, d_faultyElemData, sizeof(int), 0), "Read faultyelemdata");
+	}
+
+	bool shouldRun()
+	{
+		return g_running;
 	}
 
 	private:
 	bool d_doubles;
+	bool d_tensors;
 	int d_devNumber;
 	size_t d_iters;
 	size_t d_resultSize;
@@ -269,6 +301,7 @@ template <class T> class GPU_Test {
 	CUdeviceptr d_Adata;
 	CUdeviceptr d_Bdata;
 	CUdeviceptr d_faultyElemData;
+	int *d_faultyElemsHost;
 
 	cublasHandle_t d_cublas;
 };
@@ -290,10 +323,10 @@ int initCuda() {
 	return deviceCount;
 }
 
-template<class T> void startBurn(int index, int writeFd, T *A, T *B, bool doubles) {
+template<class T> void startBurn(int index, int writeFd, T *A, T *B, bool doubles, bool tensors) {
 	GPU_Test<T> *our;
 	try {
-		our = new GPU_Test<T>(index, doubles);
+		our = new GPU_Test<T>(index, doubles, tensors);
 		our->initBuffers(A, B);
 	} catch (std::string e) {
 		fprintf(stderr, "Couldn't init a GPU test: %s\n", e.c_str());
@@ -301,19 +334,35 @@ template<class T> void startBurn(int index, int writeFd, T *A, T *B, bool double
 	}
 
 	// The actual work
-	/*int iters = 0;
-	unsigned long long int errors = 0;*/
 	try {
-		while (true) {
+		int eventIndex = 0;
+		const int maxEvents = 2;
+		CUevent events[maxEvents];
+		for (int i = 0; i < maxEvents; ++i)
+			cuEventCreate(events + i, 0);
+
+		int nonWorkIters = maxEvents;
+
+		while (our->shouldRun()) {
 			our->compute();
 			our->compare();
-			/*errors += our->getErrors();
-			iters++;*/
+			checkError(cuEventRecord(events[eventIndex], 0), "Record event");
+
+			eventIndex = ++eventIndex % maxEvents;
+
+			while (cuEventQuery(events[eventIndex]) != CUDA_SUCCESS) usleep(1000);
+
+			if (--nonWorkIters > 0) continue;
+
 			int ops = our->getIters();
 			write(writeFd, &ops, sizeof(int));
 			ops = our->getErrors();
 			write(writeFd, &ops, sizeof(int));
 		}
+
+		for (int i = 0; i < maxEvents; ++i)
+			cuEventSynchronize(events[i]);
+		delete our;
 	} catch (std::string e) {
 		fprintf(stderr, "Failure during compute: %s\n", e.c_str());
 		int ops = -1;
@@ -542,7 +591,7 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid, int 
 		printf("\tGPU %d: %s\n", (int)i, clientFaulty.at(i) ? "FAULTY" : "OK");
 }
 
-template<class T> void launch(int runLength, bool useDoubles) {
+template<class T> void launch(int runLength, bool useDoubles, bool useTensorCores) {
 	system("nvidia-smi -L");
 
 	// Initting A and B with random data
@@ -571,7 +620,7 @@ template<class T> void launch(int runLength, bool useDoubles) {
 		int devCount = initCuda();
 		write(writeFd, &devCount, sizeof(int));
 
-		startBurn<T>(0, writeFd, A, B, useDoubles);
+		startBurn<T>(0, writeFd, A, B, useDoubles, useTensorCores);
 
 		close(writeFd);
 		return;
@@ -584,6 +633,7 @@ template<class T> void launch(int runLength, bool useDoubles) {
 
 		if (!devCount) {
 			fprintf(stderr, "No CUDA devices\n");
+			exit(EXIT_FAILURE);
 		} else {
 
 			for (int i = 1; i < devCount; ++i) {
@@ -597,7 +647,7 @@ template<class T> void launch(int runLength, bool useDoubles) {
 					// Child
 					close(slavePipe[0]);
 					initCuda();
-					startBurn<T>(i, slavePipe[1], A, B, useDoubles);
+					startBurn<T>(i, slavePipe[1], A, B, useDoubles, useTensorCores);
 
 					close(slavePipe[1]);
 					return;
@@ -627,12 +677,14 @@ void print_usage (void)
 	printf("  -d\t\t\tUse doubles instead of floats\n");
 	printf("  -m PCT\t\tUse PCT percent of available memory (default %u)\n",
 	       (unsigned)(usemem * 100.0));
+	printf("  -tc\t\t\tUse tensor cores\n");
 	printf("  -h\t\t\tPrint this help\n");
 }
 
 int main(int argc, char **argv) {
 	int runLength = 10;
 	bool useDoubles = false;
+	bool useTensorCores = false;
 	int thisParam = 0;
 	progname = argv[0];
 	while (argc - thisParam >= 2) {
@@ -658,6 +710,9 @@ int main(int argc, char **argv) {
 			}
 			usemem = (double)pct / 100.0;
 			thisParam += 2;
+		} else if (std::string(argv[1+thisParam]) == "-tc") {
+			useTensorCores = true;
+			thisParam++;
 		} else if (*argv[1+thisParam] == '-') {
 			fprintf(stderr, "unrecognized option: %s\n", argv[1+thisParam]);
 			print_usage();
@@ -682,9 +737,9 @@ int main(int argc, char **argv) {
 	tty_output = isatty(1);
 
 	if (useDoubles)
-		launch<double>(runLength, useDoubles);
+		launch<double>(runLength, useDoubles, useTensorCores);
 	else
-		launch<float>(runLength, useDoubles);
+		launch<float>(runLength, useDoubles, useTensorCores);
 
 	return 0;
 }
