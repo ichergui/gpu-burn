@@ -222,8 +222,6 @@ template <class T> class GPU_Test {
 		// Populating matrices A and B
 		checkError(cuMemcpyHtoD(d_Adata, A, d_resultSize), "A -> device");
 		checkError(cuMemcpyHtoD(d_Bdata, B, d_resultSize), "A -> device");
-
-		initCompareKernel();
 	}
 
 	void compute() {
@@ -249,25 +247,6 @@ template <class T> class GPU_Test {
 							&beta,
 							(float*)d_Cdata + i*SIZE*SIZE, SIZE), "SGEMM");
 		}
-	}
-
-	void initCompareKernel() {
-		const char *kernelFile = "compare.ptx";
-		{
-			std::ifstream f(kernelFile);
-			checkError(f.good() ? CUDA_SUCCESS : CUDA_ERROR_NOT_FOUND, std::string("couldn't find file \"") + kernelFile + "\" from working directory");
-		}
-		checkError(cuModuleLoad(&d_module, kernelFile), "load module");
-		checkError(cuModuleGetFunction(&d_function, d_module,
-					d_doubles ? "compareD" : "compare"), "get func");
-
-		checkError(cuFuncSetCacheConfig(d_function, CU_FUNC_CACHE_PREFER_L1), "L1 config");
-		checkError(cuParamSetSize(d_function, __alignof(T*) + __alignof(int*) + __alignof(size_t)), "set param size");
-		checkError(cuParamSetv(d_function, 0, &d_Cdata, sizeof(T*)), "set param");
-		checkError(cuParamSetv(d_function, __alignof(T*), &d_faultyElemData, sizeof(T*)), "set param");
-		checkError(cuParamSetv(d_function, __alignof(T*) + __alignof(int*), &d_iters, sizeof(size_t)), "set param");
-
-		checkError(cuFuncSetBlockShape(d_function, g_blockSize, g_blockSize, 1), "set block size");
 	}
 
 	void compare() {
